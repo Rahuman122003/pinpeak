@@ -141,6 +141,7 @@ function findPinNode(json: any): any | null {
 }
 
 function buildImageVariants(images: any): MediaVariant[] {
+  if (!images || typeof images !== "object") return [];
   const variants: MediaVariant[] = [];
   const seen = new Set<string>();
   const push = (label: string, v: any) => {
@@ -155,24 +156,37 @@ function buildImageVariants(images: any): MediaVariant[] {
       ext: (v.url.split(".").pop() || "jpg").split("?")[0].toLowerCase(),
     });
   };
-  const orig = images?.orig || images?.["originals"];
+
+  // Map known size keys -> a candidate quality label (only used if larger
+  // tiers are absent). Preserve real URLs only — never synthesize.
+  const orig = images.orig || images.originals;
   if (orig?.url) push("Original", orig);
-  if (!orig?.url) {
-    const any =
-      images?.["736x"] || images?.["564x"] || images?.["474x"] || images?.["236x"];
-    if (any?.url) {
-      push("Original", { ...any, url: rewriteToOriginal(any.url) });
-    }
+
+  // Collect every sized variant the API actually returned, sorted by width desc.
+  const sized: Array<{ key: string; v: any; w: number }> = [];
+  for (const k of Object.keys(images)) {
+    if (k === "orig" || k === "originals") continue;
+    const v = images[k];
+    const m = k.match(/^(\d+)x/);
+    if (v?.url && m) sized.push({ key: k, v, w: parseInt(m[1], 10) });
   }
-  const tiers: Array<[string, string]> = [
-    ["4K", "originals"],
-    ["2K", "1200x"],
-    ["Full HD", "736x"],
-    ["HD", "564x"],
-  ];
-  for (const [label, key] of tiers) {
-    const v = images?.[key];
-    if (v?.url) push(label, v);
+  sized.sort((a, b) => b.w - a.w);
+
+  // If we have no /originals/ from the API, promote the largest real size to "Original".
+  if (!orig?.url && sized.length) {
+    push("Original", sized[0].v);
+  }
+
+  const labelFor = (w: number, h?: number): string => {
+    const dim = h && h > w ? h : w;
+    if (dim >= 2160) return "4K";
+    if (dim >= 1440) return "2K";
+    if (dim >= 1080) return "Full HD";
+    if (dim >= 720) return "HD";
+    return `${dim}px`;
+  };
+  for (const s of sized) {
+    push(labelFor(s.w, s.v.height), s.v);
   }
   return variants;
 }
