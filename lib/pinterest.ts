@@ -337,6 +337,48 @@ function normalizePin(pin: any, sourceUrl: string): PinMedia {
   };
 }
 
+async function isUrlReachable(url: string): Promise<boolean> {
+  try {
+    // Try HEAD first — most CDNs respond quickly.
+    const head = await axios.head(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "*/*",
+        Referer: "https://www.pinterest.com/",
+      },
+      timeout: 6000,
+      validateStatus: () => true,
+      maxRedirects: 5,
+    });
+    if (head.status >= 200 && head.status < 400) return true;
+    // Some CDNs reject HEAD but allow GET with a Range probe.
+    const get = await axios.get(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "*/*",
+        Range: "bytes=0-0",
+      },
+      timeout: 6000,
+      validateStatus: () => true,
+      maxRedirects: 5,
+      responseType: "arraybuffer",
+    });
+    return get.status >= 200 && get.status < 400;
+  } catch {
+    return false;
+  }
+}
+
+async function pruneUnreachable(variants: MediaVariant[]): Promise<MediaVariant[]> {
+  // Concurrently probe all variants; drop any that fail.
+  const checks = await Promise.all(
+    variants.map(async (v) => ({ v, ok: await isUrlReachable(v.url) }))
+  );
+  const ok = checks.filter((c) => c.ok).map((c) => c.v);
+  // If everything failed, keep the originals so the user at least sees something.
+  return ok.length ? ok : variants;
+}
+
 async function fetchViaWidgetApi(pinId: string): Promise<any | null> {
   // Pinterest's official embed widget endpoint — public, no auth.
   const endpoint = `https://widgets.pinterest.com/v3/pidgets/pins/info/?pin_ids=${pinId}`;
@@ -408,5 +450,31 @@ export async function extractPin(rawUrl: string): Promise<PinMedia> {
     );
   }
 
-  return normalizePin(pin, url);
+  const media = normalizePin(pin, url);
+
+  // Probe top-level variants and prune dead URLs (e.g. claimed /originals/
+  // that Pinterest's CDN actually 403s). Re-promote the largest survivor
+  // to "Original" if the original itself was unreachable.
+  const before = media.variants;
+  media.variants = await pruneUnreachable(before);
+  if (media.variants.length && before.length !== media.variants.length) {
+    const hadOriginal = media.variants.some((v) => /original/i.test(v.label));
+    if (!hadOriginal) {
+      // Largest survivor (variants are already sorted big -> small for images;
+      // for videos the top mp4 is at index 0).
+      media.variants[0] = { ...media.variants[0], label: "Original" };
+    }
+  }
+
+  // For carousel/story, prune each item too (in parallel).
+  if (media.items?.length) {
+    media.items = await Promise.all(
+      media.items.map(async (it) => ({
+        ...it,
+        variants: await pruneUnreachable(it.variants),
+      }))
+    );
+  }
+
+  return media;
 }
